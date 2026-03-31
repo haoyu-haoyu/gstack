@@ -7,6 +7,7 @@
 
 import type { BrowserManager } from './browser-manager';
 import { findInstalledBrowsers, importCookies } from './cookie-import-browser';
+import * as dns from 'dns/promises';
 import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
@@ -22,6 +23,7 @@ const BLOCKED_HOSTNAMES = new Set([
 ]);
 
 const BLOCKED_HOSTNAME_SUFFIXES = ['.local', '.internal', '.localhost'];
+const ALLOWED_NAVIGATION_PROTOCOLS = new Set(['http:', 'https:']);
 
 /** Return true if the IPv4 string is in a private/reserved range. */
 function isPrivateIPv4(ip: string): boolean {
@@ -39,12 +41,42 @@ function isPrivateIPv4(ip: string): boolean {
   );
 }
 
-function isBlockedURL(rawUrl: string): string | null {
+function normalizeIPv6(ip: string): string {
+  return ip.toLowerCase().replace(/^\[|\]$/g, '').split('%')[0];
+}
+
+function isPrivateIPv6(ip: string): boolean {
+  const normalized = normalizeIPv6(ip);
+  if (normalized === '::' || normalized === '::1') {
+    return true;
+  }
+  if (normalized.startsWith('::ffff:')) {
+    const mapped = normalized.slice('::ffff:'.length);
+    return net.isIPv4(mapped) && isPrivateIPv4(mapped);
+  }
+  return /^f[c-d]/.test(normalized) || /^fe[89ab]/.test(normalized);
+}
+
+function getBlockedAddressReason(address: string): string | null {
+  if (net.isIPv4(address) && isPrivateIPv4(address)) {
+    return `${address} is a private/reserved IPv4 address`;
+  }
+  if (net.isIPv6(address) && isPrivateIPv6(address)) {
+    return `${address} is a private/reserved IPv6 address`;
+  }
+  return null;
+}
+
+async function isBlockedURL(rawUrl: string): Promise<string | null> {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
   } catch {
     return null; // let Playwright handle malformed URLs
+  }
+
+  if (!ALLOWED_NAVIGATION_PROTOCOLS.has(parsed.protocol)) {
+    return `Blocked: protocol ${parsed.protocol} is not allowed`;
   }
 
   const hostname = parsed.hostname.toLowerCase();
@@ -62,13 +94,20 @@ function isBlockedURL(rawUrl: string): string | null {
   }
 
   // IPv4 private range check
-  if (net.isIPv4(hostname) && isPrivateIPv4(hostname)) {
-    return `Blocked: ${hostname} is a private/reserved IP address`;
+  if (net.isIP(hostname)) {
+    return getBlockedAddressReason(hostname);
   }
 
-  // IPv6 loopback
-  if (hostname === '::1' || hostname === '[::1]') {
-    return `Blocked: ${hostname} is the IPv6 loopback address`;
+  try {
+    const resolvedAddresses = await dns.lookup(hostname, { all: true, verbatim: true });
+    for (const { address } of resolvedAddresses) {
+      const blockedReason = getBlockedAddressReason(address);
+      if (blockedReason) {
+        return `Blocked: ${hostname} resolves to ${blockedReason}`;
+      }
+    }
+  } catch {
+    return null; // let Playwright surface DNS resolution failures
   }
 
   return null;
@@ -85,7 +124,7 @@ export async function handleWriteCommand(
     case 'goto': {
       const url = args[0];
       if (!url) throw new Error('Usage: browse goto <url>');
-      const blocked = isBlockedURL(url);
+      const blocked = await isBlockedURL(url);
       if (blocked) throw new Error(blocked);
       const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
       const status = response?.status() || 'unknown';
